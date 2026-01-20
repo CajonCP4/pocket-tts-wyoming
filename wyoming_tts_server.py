@@ -40,6 +40,14 @@ DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "alba")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", DEFAULT_VARIANT)
 DEBUG_WAV = os.environ.get("DEBUG_WAV", "").lower() in ("true", "1", "yes")
 
+# Prefix trimming tunables (in seconds)
+# Minimum time before looking for the pause after the sacrificial prefix
+PREFIX_MIN_DURATION = float(os.environ.get("PREFIX_MIN_DURATION", "0.15"))
+# Maximum time to search for the prefix end
+PREFIX_MAX_DURATION = float(os.environ.get("PREFIX_MAX_DURATION", "1.0"))
+# Minimum silence duration to consider it the gap after the prefix
+PREFIX_SILENCE_GAP = float(os.environ.get("PREFIX_SILENCE_GAP", "0.08"))
+
 _VOICE_STATES: dict[str, dict] = {}
 _VOICE_LOCK = asyncio.Lock()
 
@@ -135,6 +143,11 @@ class PocketTTSEventHandler(AsyncEventHandler):
             return True
 
         _LOGGER.debug("synthesize: raw_text=%s, text='%s'", raw_text, text)
+        
+        # Add a sacrificial prefix to prevent the first word from being swallowed
+        # by the voice prompt "blend region". This prefix audio will be trimmed later.
+        text = "... " + text
+        
         voice_name: Optional[str] = None
 
         if synthesize.voice is not None:
@@ -212,15 +225,58 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
                 full_audio = numpy.concatenate(all_audio_arrays)
 
+                # Find and remove the sacrificial prefix ("...") by detecting the pause after it
+                # This adapts to different voice speeds rather than using a fixed duration
                 silence_threshold = 0.01
                 max_amplitude = numpy.abs(full_audio).max()
                 threshold = max_amplitude * silence_threshold
+                
+                # Minimum time before we start looking for the pause (avoid false early detection)
+                min_prefix_samples = int(sample_rate * PREFIX_MIN_DURATION)
+                # Maximum time to search for the prefix end
+                max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
+                # Minimum silence duration to consider it the gap after "..."
+                min_silence_samples = int(sample_rate * PREFIX_SILENCE_GAP)
+                
+                # Find where the prefix ends by looking for a silence gap
+                prefix_end = 0
+                if len(full_audio) > min_prefix_samples:
+                    search_end = min(len(full_audio), max_prefix_samples)
+                    is_silent = numpy.abs(full_audio[:search_end]) < threshold
+                    
+                    # Look for a silence gap after the minimum prefix duration
+                    i = min_prefix_samples
+                    while i < search_end:
+                        if is_silent[i]:
+                            # Found start of silence, check if it's long enough
+                            silence_start = i
+                            while i < search_end and is_silent[i]:
+                                i += 1
+                            silence_length = i - silence_start
+                            if silence_length >= min_silence_samples:
+                                # Found the gap after the prefix - start after this silence
+                                prefix_end = i
+                                break
+                        else:
+                            i += 1
+                
+                if prefix_end > 0:
+                    _LOGGER.debug("Trimming prefix: %d samples (%.3fs)", 
+                                  prefix_end, prefix_end / sample_rate)
+                    full_audio = full_audio[prefix_end:]
 
+                # Trim any remaining leading silence
                 non_silent_indices = numpy.where(numpy.abs(full_audio) > threshold)[0]
                 if len(non_silent_indices) > 0:
-                    padding_samples = int(sample_rate * 0.05)
-                    last_non_silent = non_silent_indices[-1] + padding_samples
-                    full_audio = full_audio[:last_non_silent + 1]
+                    padding_samples = int(sample_rate * 0.05)  # 50ms padding
+                    first_non_silent = max(0, non_silent_indices[0] - padding_samples)
+                    full_audio = full_audio[first_non_silent:]
+                    
+                    # Trim trailing silence at the end
+                    non_silent_indices = numpy.where(numpy.abs(full_audio) > threshold)[0]
+                    if len(non_silent_indices) > 0:
+                        last_non_silent = non_silent_indices[-1] + padding_samples
+                        full_audio = full_audio[:last_non_silent + 1]
 
                 full_audio = (full_audio.clip(-1.0, 1.0) * 32767).astype("int16")
                 audio_bytes = full_audio.tobytes()
@@ -229,13 +285,13 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 if self.cli_args.debug_wav:
                     try:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                        wav_filename = f"/app/debug_{voice_name}_{timestamp}.wav"
+                        wav_filename = f"/output/debug_{voice_name}_{timestamp}.wav"
                         with wave.open(wav_filename, "wb") as wav_file:
                             wav_file.setnchannels(channels)
                             wav_file.setsampwidth(width)
                             wav_file.setframerate(sample_rate)
                             wav_file.writeframes(audio_bytes)
-                        _LOGGER.debug("Debug WAV file written: %s", wav_filename)
+                        _LOGGER.info("Debug WAV file written: %s", wav_filename)
                     except Exception as e:
                         _LOGGER.warning("Failed to write debug WAV file: %s", e)
 
@@ -316,8 +372,7 @@ async def main() -> None:
     parser.add_argument(
         "--debug-wav",
         action="store_true",
-        default=DEBUG_WAV,
-        help="Write complete WAV file to /app/ on every response (default: from DEBUG_WAV env var)",
+        help="Write complete WAV file to /output/ on every response (default: from DEBUG_WAV env var)",
     )
     parser.add_argument(
         "--log-format",
@@ -326,9 +381,17 @@ async def main() -> None:
     )
 
     args = parser.parse_args()
+    
+    # Override debug_wav from environment if not explicitly set via command line
+    # Check environment variable at runtime (not just at module load)
+    debug_wav_env = os.environ.get("DEBUG_WAV", "").lower() in ("true", "1", "yes")
+    if not args.debug_wav:
+        args.debug_wav = debug_wav_env
 
     log_level = logging.DEBUG if args.debug else (logging.ERROR if args.quiet else logging.INFO)
     logging.basicConfig(level=log_level, format=args.log_format)
+    if args.debug_wav:
+        _LOGGER.info("Debug WAV mode enabled - WAV files will be written to /output/ on every response")
     _LOGGER.debug(args)
 
     os.environ["MODEL_VARIANT"] = args.variant

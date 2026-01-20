@@ -100,6 +100,37 @@ The server supports Zeroconf/mDNS for automatic discovery.
 4. The server should appear in the "Discovered" section, or enter `tcp://<server-ip>:10201` manually
 5. Configure a Voice Assistant pipeline to use the TTS service and select a voice
 
+## Debug Mode
+
+Debug mode writes WAV files for each synthesis request and exposes timing tunables for diagnosing audio issues (such as the first word being cut off).
+
+To run in debug mode, include the debug overlay file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d --build
+```
+
+This enables:
+- **WAV file output**: Each synthesis writes a debug WAV file to the project directory
+- **Timing tunables**: Environment variables to adjust the sacrificial prefix trimming
+
+### Background
+
+Audio-prompt based TTS models like Pocket-TTS can "swallow" the first word into a blend region when transitioning from the voice prompt. To prevent this, a sacrificial prefix (`"..."`) is prepended to all text and then trimmed from the resulting audio. Debug mode lets you tune this trimming.
+
+### Timing Tunables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PREFIX_MIN_DURATION` | `0.15` | Minimum seconds before looking for the pause after the prefix |
+| `PREFIX_MAX_DURATION` | `1.0` | Maximum seconds to search for the prefix end |
+| `PREFIX_SILENCE_GAP` | `0.08` | Minimum silence duration (seconds) to identify the gap after the prefix |
+
+**Tuning tips:**
+- If you hear part of the "..." prefix, decrease `PREFIX_SILENCE_GAP` to catch shorter pauses
+- If the first syllable is still being cut, increase `PREFIX_MIN_DURATION`
+- Different voices speak at different speeds, so optimal values may vary
+
 ## Troubleshooting
 
 - **Slow startup**: First run downloads ~500MB of model weights. Use volume mounts to persist the cache.
@@ -107,3 +138,4 @@ The server supports Zeroconf/mDNS for automatic discovery.
 - **Voice not found**: Ensure the voice name matches one of the 8 predefined voices listed above.
 - **Image pull issues**: If you encounter authentication issues pulling from GHCR, ensure you're logged in: `docker login ghcr.io`
 - **Outdated image**: Pull the latest image with `docker compose pull` or `docker pull ghcr.io/ikidd/pocket-tts-wyoming:latest`
+- **First word cut off**: Run in debug mode and check the WAV files. Adjust the timing tunables as needed.
