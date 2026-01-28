@@ -88,7 +88,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
                     self._synthesize.text = self._stream_text.strip()
                     await self._handle_synthesize(self._synthesize, send_start=True, send_stop=True)
 
-                # WICHTIG für HA Debug Zeiten:
                 await self.write_event(SynthesizeStopped().event())
                 self.is_streaming = False
                 self._stream_text = ""
@@ -119,8 +118,11 @@ class PocketTTSEventHandler(AsyncEventHandler):
             global _VOICE_STATES
             if voice_name not in _VOICE_STATES:
                 _LOGGER.info("Loading voice state: %s", voice_name)
-                # In der offiziellen Lib heißt es get_state_for_voice
-                _VOICE_STATES[voice_name] = self.tts_model.get_state_for_voice(voice_name)
+                # Kompatibilitäts-Check für Voice Loading
+                if hasattr(self.tts_model, 'get_state_for_voice'):
+                    _VOICE_STATES[voice_name] = self.tts_model.get_state_for_voice(voice_name)
+                else:
+                    _VOICE_STATES[voice_name] = self.tts_model.get_state_for_audio_prompt(voice_name)
             
             voice_state = _VOICE_STATES[voice_name]
 
@@ -157,7 +159,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
                 if send_stop:
                     await self.write_event(AudioStop().event())
-                    # Auch hier für HA Debug Zeiten:
                     await self.write_event(SynthesizeStopped().event())
 
                 _LOGGER.info("Synthesis complete")
@@ -208,14 +209,27 @@ async def main() -> None:
 
     logging.basicConfig(level=logging.INFO)
     
-    # KORREKTUR: In der offiziellen Lib heißt das Argument model_variant
-    _LOGGER.info("Loading Pocket-TTS model (variant: %s)...", args.variant)
-    tts_model = TTSModel.load_model(model_variant=args.variant)
+    _LOGGER.info("Loading Pocket-TTS model (%s)...", args.variant)
+    
+    # --- ROBUSTER LADE-FIX ---
+    # Wir probieren es erst positional, das funktioniert fast immer
+    try:
+        tts_model = TTSModel.load_model(args.variant)
+    except TypeError:
+        # Falls es doch einen Namen braucht, probieren wir 'variant_id' (Kyutai Standard)
+        try:
+            tts_model = TTSModel.load_model(variant_id=args.variant)
+        except TypeError:
+            # Letzter Strohhalm: Wieder 'variant'
+            tts_model = TTSModel.load_model(variant=args.variant)
     
     _LOGGER.info("Pre-loading voice states...")
     for v in PREDEFINED_VOICES:
         try:
-             _VOICE_STATES[v] = tts_model.get_state_for_voice(v)
+             if hasattr(tts_model, 'get_state_for_voice'):
+                 _VOICE_STATES[v] = tts_model.get_state_for_voice(v)
+             else:
+                 _VOICE_STATES[v] = tts_model.get_state_for_audio_prompt(v)
         except: pass
 
     voices = [
