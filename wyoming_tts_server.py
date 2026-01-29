@@ -31,6 +31,7 @@ DEFAULT_PORT = int(os.environ.get("WYOMING_PORT", "10201"))
 DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "alba")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", DEFAULT_VARIANT)
 
+# Tuning für Trimming
 PREFIX_MIN_DURATION = 0.08
 PREFIX_MAX_DURATION = 0.8
 PREFIX_SILENCE_GAP = 0.06
@@ -83,27 +84,28 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 chunk = SynthesizeChunk.from_event(event)
                 self._text_buffer += chunk.text
                 
-                # Bestimme Threshold für Chunks
-                # Chunk 0 (Satz 1): 1 Satz
-                # Chunk 1 (Satz 2-3): 2 Sätze
-                # Chunk 2+ (Rest): Alles verfügbare
+                # PROGRESSIVER THRESHOLD:
+                # 0. Chunk (Erster Satz): 1 Satz
+                # 1. Chunk (Satz 2-4): 3 Sätze
+                # 2. Chunk (Ab Satz 5): 50 Sätze (praktisch "der Rest")
                 if self._chunk_count == 0:
                     threshold = 1
                 elif self._chunk_count == 1:
-                    threshold = 2
+                    threshold = 3
                 else:
-                    threshold = 1 # "Mindestens 1", aber wir nehmen im Code dann alles
+                    threshold = 50 
 
                 if self._count_sentences(self._text_buffer) >= threshold:
-                    # Ab dem 3. Chunk (index 2) nutzen wir force_all_sentences
+                    # Wir nutzen take_all_complete=True ab dem 2. Chunk (index 1)
                     await self._process_buffer(
                         threshold=threshold, 
-                        take_all_complete=(self._chunk_count >= 2)
+                        take_all_complete=(self._chunk_count >= 1)
                     )
                 return True
 
             if SynthesizeStop.is_type(event.type):
                 if self.is_streaming:
+                    # Beim Stop vom LLM nehmen wir den gesamten Rest (auch ohne Punkt am Ende)
                     await self._process_buffer(force_all_buffer=True)
                     if self._audio_started:
                         await self.write_event(AudioStop().event())
@@ -118,7 +120,8 @@ class PocketTTSEventHandler(AsyncEventHandler):
             return False
 
     def _count_sentences(self, text: str) -> int:
-        # Splittet nur bei . ! ? gefolgt von Leerzeichen oder Ende
+        # Zählt Sätze (Punkt, Ausrufezeichen, Fragezeichen gefolgt von Leerzeichen oder Ende)
+        # Verhindert Splitting bei "2.0" oder "Dr. Peter"
         return len(re.findall(r'[.!?](\s|$)', text))
 
     def _cancel_current(self):
@@ -129,25 +132,25 @@ class PocketTTSEventHandler(AsyncEventHandler):
         if not self._text_buffer.strip(): return
 
         to_speak = ""
-        # Wir splitten bei Satzzeichen gefolgt von Whitespace
-        # Die Klammern im Regex ( ) sorgen dafür, dass die Satzzeichen im Array bleiben
+        # Wir splitten nur bei echten Satzzeichen
         split_pattern = r'([.!?](?:\s+|$))'
         
         if force_all_buffer:
+            # LLM ist fertig: Alles raus, was noch da ist
             to_speak = self._text_buffer.strip()
             self._text_buffer = ""
         else:
             parts = re.split(split_pattern, self._text_buffer)
-            # parts sieht so aus: ["Satz 1", ". ", "Satz 2", "! ", "Restlicher Text"]
+            # parts: ["Satz 1", ". ", "Satz 2", "! ", "Unvollständiger Rest..."]
             
             if take_all_complete:
-                # Nimm alle fertigen Sätze
+                # Nimm alle fertigen Sätze, lass den unvollständigen Rest im Puffer
                 last_punctuation_idx = (len(parts) // 2) * 2
                 if last_punctuation_idx > 0:
                     to_speak = "".join(parts[:last_punctuation_idx]).strip()
                     self._text_buffer = "".join(parts[last_punctuation_idx:])
             else:
-                # Nimm genau 'threshold' Sätze
+                # Nimm exakt die Anzahl 'threshold' an Sätzen
                 if len(parts) >= (threshold * 2):
                     end_idx = threshold * 2
                     to_speak = "".join(parts[:end_idx]).strip()
@@ -192,8 +195,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
                 
                 for chunk_tensor in audio_stream:
-                    if asyncio.current_task().cancelled():
-                        raise asyncio.CancelledError()
+                    if asyncio.current_task().cancelled(): raise asyncio.CancelledError()
 
                     chunk_data = chunk_tensor.detach().cpu().numpy().flatten()
                     if not prefix_processed:
